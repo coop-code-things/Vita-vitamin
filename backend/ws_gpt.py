@@ -1,0 +1,174 @@
+
+# Updated ws_gpt.py
+
+import os
+from datetime import datetime
+from dotenv import load_dotenv
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from crud import insert_user_session
+from db import async_session
+from openai import AsyncOpenAI
+
+load_dotenv()
+
+openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+base_user_data = {
+    "name": None,
+    "age": None,
+    "sex": None,
+    "weight_kg": None,
+    "height_cm": None,
+    "diet_type": None,
+    "food_allergies": [],
+    "activity_level": None,
+    "sleep_hours": None,
+    "smoking": None,
+    "alcohol": None,
+    "goals": [],
+    "symptoms": [],
+    "current_stack": [],
+    "urgency": None,
+    "timestamp": None
+}
+
+router = APIRouter()
+
+fields_sequence = list(base_user_data.keys())[:-1]  # exclude timestamp
+
+def get_prompt_for_field(field):
+    prompts = {
+        "name": "Hi! I'm Vita, your health assistant 🌿. Let's start — what's your first name?",
+        "age": "Thanks! How old are you?",
+        "sex": "What's your biological sex? (male, female, other)",
+        "weight_kg": "What's your weight in kilograms?",
+        "height_cm": "And your height in centimeters?",
+        "diet_type": "Are you on any specific diet? (e.g., vegan, keto, pescatarian)",
+        "food_allergies": "Any food allergies or ingredients you avoid?",
+        "activity_level": "How active are you? (low, moderate, intense)",
+        "sleep_hours": "How many hours do you sleep per night?",
+        "smoking": "Do you smoke? (yes or no)",
+        "alcohol": "Do you drink alcohol? (often, occasionally, never)",
+        "goals": "What are your top 2–3 health goals?",
+        "symptoms": "Any current symptoms or concerns?",
+        "current_stack": "Are you currently taking any supplements?",
+        "urgency": "How soon are you hoping to feel results?"
+    }
+    return prompts[field]
+
+def validate_input(field, input_text):
+    input_text = input_text.strip()
+    if field == "age":
+        return input_text.isdigit() and 0 < int(input_text) < 120
+    elif field == "sex":
+        return input_text.lower() in ["male", "female", "other"]
+    elif field in ["weight_kg", "height_cm", "sleep_hours"]:
+        return input_text.replace(".", "", 1).isdigit()
+    elif field == "smoking":
+        return input_text.lower() in ["yes", "no"]
+    return True
+
+def format_protocol_prompt(user_data: dict) -> str:
+    return f"""
+You're a licensed functional medicine nutritionist. Based on the user data below, create a personalized daily vitamin & supplement protocol.
+
+User Profile:
+- Name: {user_data['name']}
+- Age: {user_data['age']}
+- Sex: {user_data['sex']}
+- Weight: {user_data['weight_kg']} kg
+- Height: {user_data['height_cm']} cm
+- Diet Type: {user_data['diet_type']}
+- Allergies: {', '.join(user_data['food_allergies'])}
+- Activity Level: {user_data['activity_level']}
+- Sleep Hours: {user_data['sleep_hours']}
+- Smoking: {user_data['smoking']}
+- Alcohol Use: {user_data['alcohol']}
+- Health Goals: {', '.join(user_data['goals'])}
+- Symptoms: {', '.join(user_data['symptoms'])}
+- Current Supplements: {', '.join(user_data['current_stack'])}
+- Desired Results Timeframe: {user_data['urgency']}
+
+Instructions:
+- Use evidence-based suggestions.
+- Mention timing (morning/night), dosage (mg/IU), and form (capsule/powder/etc).
+- Note any important interactions or cautions.
+- Keep it clean, professional, and useful.
+"""
+
+@router.websocket("/ws/gpt")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    user_data = base_user_data.copy()
+    current_index = 0
+
+    try:
+        await websocket.send_text("\U0001f44b Hey! I'm Vita — your health assistant. Let's get started...")
+
+        while current_index < len(fields_sequence):
+            field = fields_sequence[current_index]
+            prompt = get_prompt_for_field(field)
+
+            gpt_response = await openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "Rephrase the following prompt in a clear and friendly tone. Do not add or remove content."},
+                    {"role": "user", "content": prompt}
+                ],
+                stream=False
+            )
+
+            full_prompt = gpt_response.choices[0].message.content
+            await websocket.send_text(full_prompt)
+
+            user_input = await websocket.receive_text()
+
+            if not validate_input(field, user_input):
+                await websocket.send_text(f"⚠️ That doesn’t seem valid for {field}. Can you try again?")
+                continue
+
+            if field == "smoking" and user_input.lower() == "yes":
+                await websocket.send_text("What do you smoke? (e.g., cigarettes, weed, vapes, cigars, other)")
+                what_smoke = await websocket.receive_text()
+                user_data["smoking"] = {"active": True, "type": what_smoke}
+                current_index += 1
+                continue
+
+            if field in ["food_allergies", "goals", "symptoms", "current_stack"]:
+                user_data[field] = [x.strip() for x in user_input.split(",")]
+            elif field in ["weight_kg", "height_cm", "sleep_hours"]:
+                user_data[field] = float(user_input)
+            elif field == "age":
+                user_data[field] = int(user_input)
+            elif field == "smoking":
+                user_data[field] = {"active": False, "type": None}
+            else:
+                user_data[field] = user_input
+
+            current_index += 1
+
+        user_data["timestamp"] = datetime.utcnow().isoformat()
+        await websocket.send_text("✅ Got it! All your data is collected. Generating your protocol next...")
+
+        print("✅ Final user data:\n", user_data)
+
+        async with async_session() as db:
+            await insert_user_session(db, user_data)
+
+        protocol_prompt = format_protocol_prompt(user_data)
+
+        protocol_response = await openai_client.chat.completions.create(
+            model=os.getenv("GPT_MODEL", "gpt-4"),
+            messages=[
+                {"role": "system", "content": "You are a licensed health professional who creates personalized supplement plans."},
+                {"role": "user", "content": protocol_prompt}
+            ],
+            stream=False
+        )
+
+        final_protocol = protocol_response.choices[0].message.content
+        await websocket.send_text("\n📋 Your personalized protocol:\n")
+        await websocket.send_text(final_protocol)
+
+    except WebSocketDisconnect:
+        print("User disconnected")
