@@ -96,7 +96,7 @@ Instructions:
 - Keep it clean, professional, and useful.
 """
 
-@router.websocket("/ws/gpt")
+@router.websocket("/gpt")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     user_data = base_user_data.copy()
