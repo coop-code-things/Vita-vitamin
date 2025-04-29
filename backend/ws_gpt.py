@@ -156,16 +156,21 @@ async def websocket_endpoint(websocket: WebSocket):
             await insert_user_session(db, user_data)
 
         protocol_prompt = format_protocol_prompt(user_data)
-
+        print("🧠 SENDING TO GPT-4o:\n", protocol_prompt)
         protocol_response = await openai_client.chat.completions.create(
-            model=os.getenv("GPT_MODEL", "gpt-4"),
+            model=os.getenv("GPT_MODEL", "gpt-4o"),
             messages=[
                 {"role": "system", "content": "You are a licensed health professional who creates personalized supplement plans."},
                 {"role": "user", "content": protocol_prompt}
             ],
             stream=False
         )
-
+        print("📬 GPT-4o RESPONSE:\n", protocol_response)
+        
+        if not protocol_response.choices:
+            await websocket.send_text("⚠️ GPT-4o did not return any suggestions.")
+            return 
+            
         final_protocol = protocol_response.choices[0].message.content
         await websocket.send_text("\n📋 Your personalized protocol:\n")
         await websocket.send_text(final_protocol)
